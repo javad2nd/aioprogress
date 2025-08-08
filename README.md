@@ -12,9 +12,9 @@ Supports resume downloads, progress tracking, cancellation, proxy support, and c
 ## Installation:
 ### Basic:
 ```
-pip install aiohttp aiofiles
+pip install aioprogress
 ```
 ### With SOCK5 Support:
 ```
-pip install aiohttp aiofiles aiohttp-socks
+pip install aioprogress aiohttp-socks
 ```
