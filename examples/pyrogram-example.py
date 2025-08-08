@@ -24,7 +24,7 @@ async def main():
                 await sent.edit(f"Downloading {progress:.2f}%")
 
             file_path = await message.download(
-                progress=Progress(progress_callback, interval=3)
+                progress=Progress(progress_callback, interval=3)   # update progress bar every 3 seconds
             )
             await message.edit(f"Downloaded to {file_path}")
 

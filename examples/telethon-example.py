@@ -22,7 +22,7 @@ async def handler(event):
             await message.edit(f"Downloading {progress:.2f}%")
 
         file_path = await event.download_media(
-            progress_callback=Progress(progress_callback, interval=3)
+            progress_callback=Progress(progress_callback, interval=3)  # update progress bar every 3 seconds
         )
         await message.edit(f"Downloaded to {file_path}")
 
