@@ -2,7 +2,7 @@ import asyncio
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from aioprogress import Progress
+from aioprogress.progress import Progress, ProgressData
 import os
 
 api_id = 123456  # Your API ID from https://my.telegram.org
@@ -20,8 +20,12 @@ async def main():
         async def download_document(_, message: Message):
             # show progress to user
             sent = await message.reply("Downloading...")
-            async def progress_callback(progress):
-                await sent.edit(f"Downloading {progress:.2f}%")
+            async def progress_callback(progress: ProgressData):
+                await sent.edit(f"""
+                    Downloading {progress}
+                    Speed: {progress.speed_human_readable}
+                    {progress.current_human_readable} / {progress.total_human_readable}
+                """)
 
             file_path = await message.download(
                 progress=Progress(progress_callback, interval=3)   # update progress bar every 3 seconds

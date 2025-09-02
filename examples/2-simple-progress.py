@@ -1,10 +1,10 @@
-from aioprogress import AsyncDownloader
+from aioprogress import AsyncDownloader, ProgressData
 import asyncio
 
 
 async def main():
-    def show_progress(progress, speed_human_readable, eta_human_readable):
-        print(f"{progress:.1f}% | {speed_human_readable} | ETA: {eta_human_readable}")
+    def show_progress(progress: ProgressData):
+        print(f"{progress} | {progress.speed_human_readable} | ETA: {progress.eta_human_readable}")
 
     url = 'https://mirror.nforce.com/pub/speedtests/25mb.bin'
     async with AsyncDownloader(url, "./downloads/", progress_callback=show_progress) as downloader:

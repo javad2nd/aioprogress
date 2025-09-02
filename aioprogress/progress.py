@@ -2,33 +2,88 @@ import time
 import inspect
 import typing
 import asyncio
+from dataclasses import dataclass
+
 from aioprogress.utils import format_time, format_bytes
+
+
+@dataclass
+class ProgressData:
+    """
+    Data class to store all progress-related variables and calculations.
+
+    Attributes:
+        current: Bytes downloaded so far
+        total: Total bytes to download
+        speed: Current download speed in bytes/second
+        elapsed: Time elapsed since download started
+        eta: Estimated time remaining
+        progress: Progress percentage (0-100)
+        current_human_readable: Human-readable current bytes (e.g., "1.2 MB")
+        total_human_readable: Human-readable total bytes (e.g., "10.5 MB")
+        speed_human_readable: Human-readable speed (e.g., "2.3 MB/s")
+        elapsed_human_readable: Human-readable elapsed time (e.g., "1m 30s")
+        eta_human_readable: Human-readable ETA (e.g., "5m 20s")
+    """
+    current: int
+    total: int
+    speed: float
+    elapsed: float
+    eta: float
+    progress: float
+    current_human_readable: str
+    total_human_readable: str
+    speed_human_readable: str
+    elapsed_human_readable: str
+    eta_human_readable: str
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for easy parameter passing."""
+        return {
+            'current': self.current,
+            'total': self.total,
+            'speed': self.speed,
+            'elapsed': self.elapsed,
+            'eta': self.eta,
+            'progress': self.progress,
+            'current_human_readable': self.current_human_readable,
+            'total_human_readable': self.total_human_readable,
+            'speed_human_readable': self.speed_human_readable,
+            'elapsed_human_readable': self.elapsed_human_readable,
+            'eta_human_readable': self.eta_human_readable,
+        }
+
+    def __int__(self):
+        return int(self.progress)
+
+    def __str__(self):
+        return f"{self.progress:.2f}%"
 
 
 class Progress:
     """
     Handles progress tracking and updates for file downloads.
-    
+
     Provides speed calculation, ETA estimation, and formatted output
     for both human-readable and programmatic use.
-    
+
     Args:
         callback: Function to call with progress updates
         interval: Minimum time between progress updates (seconds)
         loop: Event loop to use for async callbacks
-        
+
     Example:
-        >>> def my_callback(progress, speed_human_readable, eta_human_readable):
-        ...     print(f"{progress:.1f}% - {speed_human_readable} - ETA: {eta_human_readable}")
+        >>> def my_callback(data: ProgressData):
+        ...     print(f"{data.progress:.1f}% - {data.speed_human_readable} - ETA: {data.eta_human_readable}")
         >>> progress = Progress(my_callback, interval=2.0)
         >>> progress(1024, 10240)  # current bytes, total bytes
     """
-    
+
     def __init__(
-        self,
-        callback: typing.Optional[callable] = None,
-        interval: float = 1.0,
-        loop: asyncio.AbstractEventLoop = None
+            self,
+            callback: typing.Optional[callable] = None,
+            interval: float = 1.0,
+            loop: asyncio.AbstractEventLoop = None
     ) -> None:
         """
         Initialize the progress tracker.
@@ -43,13 +98,12 @@ class Progress:
         self.start_time: float | None = None
         self.last_edit: float = 0
         self.last_bytes: float = 0
-        self.callback_params = set(inspect.signature(self.callback).parameters.keys())
         self.loop = loop or asyncio.get_event_loop()
 
     def __call__(self, current: int, total: int) -> None:
         """
         Update progress with current download status.
-        
+
         Calculates speed, ETA, and percentage, then calls the callback
         with relevant parameters based on its signature.
 
@@ -75,29 +129,27 @@ class Progress:
         elapsed_str = format_time(elapsed)
         eta_str = format_time(eta)
 
-        vars_dict = {
-            "current": current,
-            "total": total,
-            "speed": speed,
-            "elapsed": elapsed,
-            "eta": eta,
-            "progress": progress,
-            "current_human_readable": current_str,
-            "total_human_readable": total_str,
-            "speed_human_readable": speed_str,
-            "elapsed_human_readable": elapsed_str,
-            "eta_human_readable": eta_str,
-        }
+        datas = ProgressData(
+            current=current,
+            total=total,
+            speed=speed,
+            elapsed=elapsed,
+            eta=eta,
+            progress=progress,
+            current_human_readable=current_str,
+            total_human_readable=total_str,
+            speed_human_readable=speed_str,
+            elapsed_human_readable=elapsed_str,
+            eta_human_readable=eta_str,
+        )
 
-        kwargs = {key: value for key, value in vars_dict.items() if key in self.callback_params}
-        
         if inspect.iscoroutinefunction(self.callback):
-            self.loop.create_task(self.callback(**kwargs))
+            self.loop.create_task(self.callback(datas))
         else:
-            self.callback(**kwargs)
+            self.callback(datas)
 
         self.last_bytes = current
 
-    def default(self, progress):
+    def default(self, progress: ProgressData):
         """Default progress callback that prints percentage."""
-        print(f"{progress:.2f}%")
+        print(progress)

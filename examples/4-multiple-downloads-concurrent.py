@@ -1,6 +1,5 @@
-import asyncio
-
 from aioprogress import DownloadManager, DownloadConfig
+import asyncio
 
 
 async def main():

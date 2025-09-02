@@ -15,6 +15,7 @@ class DownloadState(Enum):
     Enumeration of possible download states.
     
     States:
+        UNDEFINED: Download State is undefined
         PENDING: Download is queued but not started
         DOWNLOADING: Download is actively in progress
         PAUSED: Download is temporarily paused
@@ -22,6 +23,7 @@ class DownloadState(Enum):
         CANCELLED: Download was cancelled by user
         FAILED: Download failed due to error
     """
+    UNDEFINED = "undefined"
     PENDING = "pending"
     DOWNLOADING = "downloading"
     PAUSED = "paused"
@@ -103,8 +105,8 @@ class AsyncDownloader:
         
     Example:
         >>> # Basic usage
-        >>> async def progress_cb(progress, speed_human_readable):
-        ...     print(f"{progress:.1f}% at {speed_human_readable}")
+        >>> async def progress_cb(data: ProgressData):
+        ...     print(f"{data.progress:.1f}% at {data.speed_human_readable}")
         >>> 
         >>> async with AsyncDownloader(
         ...     "https://example.com/video.mp4",
@@ -491,7 +493,7 @@ class DownloadManager:
         url: str,
         output_path: str,
         config: DownloadConfig = None,
-        progress_callback: callable = None,
+        progress_callback: typing.Optional[callable] = None,
         download_id: str = None
     ) -> str:
         """
@@ -621,7 +623,7 @@ class DownloadManager:
         """
         if download_id in self.downloads:
             return self.downloads[download_id].state
-        return None
+        return DownloadState.UNDEFINED
 
     def remove_download(self, download_id: str):
         """
