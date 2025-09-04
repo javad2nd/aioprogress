@@ -79,7 +79,7 @@ class Progress:
         >>> progress(1024, 10240)  # current bytes, total bytes
     """
 
-    NONE = lambda: None
+    NONE = lambda x: None
 
     def __init__(
             self,
