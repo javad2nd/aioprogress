@@ -105,6 +105,8 @@ class AsyncDownloader:
         
     Example:
         >>> # Basic usage
+        >>> from aioprogress import ProgressData
+        >>>
         >>> async def progress_cb(data: ProgressData):
         ...     print(f"{data.progress:.1f}% at {data.speed_human_readable}")
         >>> 

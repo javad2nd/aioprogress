@@ -79,6 +79,8 @@ class Progress:
         >>> progress(1024, 10240)  # current bytes, total bytes
     """
 
+    NONE = lambda: None
+
     def __init__(
             self,
             callback: typing.Optional[callable] = None,
