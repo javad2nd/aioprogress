@@ -9,6 +9,7 @@ import aiofiles.os
 from dataclasses import dataclass, field
 from enum import Enum
 from .progress import Progress
+from .fetch_info import URLInfoFetcher, FetchConfig, URLInfo
 
 class DownloadState(Enum):
     """
@@ -91,7 +92,7 @@ class AsyncDownloader:
     - Resume interrupted downloads
     - Progress tracking with callbacks
     - Cancellation and pause/resume
-    - File validation (extensions, content types)
+    - File validation (extensions, content types) using URLInfo from fetch_info
     - Automatic retry with exponential backoff
     - SSL validation control
     - HTTP/HTTPS/SOCKS proxy support
@@ -135,7 +136,7 @@ class AsyncDownloader:
         >>> async with AsyncDownloader(url, path, config) as downloader:
         ...     await downloader.start()
     """
-    
+
     def __init__(
         self,
         url: str,
@@ -164,44 +165,57 @@ class AsyncDownloader:
         self.pause_event = asyncio.Event()
         self.current_task: asyncio.Task = None
         self.resume_position = 0
+        self.url_info: URLInfo = None
 
     async def __aenter__(self):
         """Async context manager entry. Sets up HTTP session with proxy support."""
         connector_kwargs = {'ssl': self.config.validate_ssl}
-        
+
+        fetch_config = FetchConfig(
+            timeout=self.config.timeout,
+            headers=self.config.headers,
+            validate_ssl=self.config.validate_ssl,
+            proxy_url=self.config.proxy_url,
+            proxy_auth=self.config.proxy_auth,
+            trust_env=self.config.trust_env
+        )
+        self.fetcher = URLInfoFetcher(fetch_config)
+        await self.fetcher.__aenter__()
+        self.url_info = await self.fetcher.fetch_info(self.url)
+
         if self.config.proxy_url:
             connector = aiohttp.TCPConnector(**connector_kwargs)
-            
+
             session_kwargs = {
                 'connector': connector,
                 'timeout': self.config.timeout,
                 'headers': self.config.headers,
                 'trust_env': self.config.trust_env
             }
-            
+
             if self.config.proxy_url.startswith(('http://', 'https://')):
                 session_kwargs['proxy'] = self.config.proxy_url
-                
+
                 if self.config.proxy_auth:
                     session_kwargs['proxy_auth'] = aiohttp.BasicAuth(
-                        self.config.proxy_auth[0], 
+                        self.config.proxy_auth[0],
                         self.config.proxy_auth[1]
                     )
-                
+
                 if self.config.proxy_headers:
                     session_kwargs['proxy_headers'] = self.config.proxy_headers
-                    
+
             elif self.config.proxy_url.startswith('socks'):
                 try:
                     import aiohttp_socks
                     from aiohttp_socks import ProxyType
-                    
+
                     proxy_type = ProxyType.SOCKS5 if 'socks5' in self.config.proxy_url else ProxyType.SOCKS4
-                    
+
                     proxy_parts = self.config.proxy_url.replace('socks4://', '').replace('socks5://', '').split(':')
                     proxy_host = proxy_parts[0]
                     proxy_port = int(proxy_parts[1]) if len(proxy_parts) > 1 else 1080
-                    
+
                     connector = aiohttp_socks.ProxyConnector(
                         proxy_type=proxy_type,
                         host=proxy_host,
@@ -211,9 +225,10 @@ class AsyncDownloader:
                         **connector_kwargs
                     )
                     session_kwargs['connector'] = connector
-                    
+
                 except ImportError:
-                    raise ImportError("aiohttp-socks is required for SOCKS proxy support. Install with: pip install aiohttp-socks")
+                    raise ImportError(
+                        "aiohttp-socks is required for SOCKS proxy support. Install with: pip install aiohttp-socks")
             else:
                 raise ValueError(f"Unsupported proxy protocol: {self.config.proxy_url}")
         else:
@@ -224,7 +239,7 @@ class AsyncDownloader:
                 'headers': self.config.headers,
                 'trust_env': self.config.trust_env
             }
-        
+
         self.session = aiohttp.ClientSession(**session_kwargs)
         return self
 
@@ -232,58 +247,59 @@ class AsyncDownloader:
         """Async context manager exit. Cleans up HTTP session."""
         if self.session:
             await self.session.close()
+        if self.fetcher:
+            await self.fetcher.__aexit__(exc_type, exc_val, exc_tb)
 
     def _get_filename_from_response(self, response: aiohttp.ClientResponse) -> str:
         """
         Extract filename from HTTP response headers or URL.
-        
+
         Args:
             response: HTTP response object
-            
+
         Returns:
             Filename string, defaulting to 'download' if none found
         """
         if disposition := response.headers.get("Content-Disposition"):
             if match := search(r"filename[*]?=(?:[\"']?)([^\"';]+)(?:[\"']?)", disposition):
                 return match.group(1)
-        
+
         path = urlparse(self.url).path
         filename = basename(path) if path else "download"
         return filename or "download"
 
-    def _validate_file(self, filename: str, content_type: str) -> tuple[bool, str]:
+    def _validate_file(self, url_info: URLInfo) -> tuple[bool, str]:
         """
-        Validate file against configured restrictions.
-        
+        Validate file against configured restrictions using URLInfo metadata.
+
         Args:
-            filename: Name of the file
-            content_type: HTTP Content-Type header value
-            
+            url_info: URLInfo object containing file metadata
+
         Returns:
             Tuple of (is_valid, error_message)
         """
-        if self.config.allowed_extensions:
-            ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+        if self.config.allowed_extensions and url_info.extension:
+            ext = url_info.extension.lower()
             if ext not in self.config.allowed_extensions:
                 return False, f"Extension '{ext}' not allowed"
 
-        if self.config.validate_content_type and self.config.expected_content_types:
-            if not any(ct in content_type for ct in self.config.expected_content_types):
-                return False, f"Content type '{content_type}' not allowed"
+        if self.config.validate_content_type and self.config.expected_content_types and url_info.mime_type:
+            if not any(ct in url_info.mime_type for ct in self.config.expected_content_types):
+                return False, f"Content type '{url_info.mime_type}' not allowed"
 
         return True, ""
 
     async def _get_resume_position(self, filepath: str) -> int:
         """
-        Get the byte position to resume download from.
-        
+        Get the byte position to resume download from, considering server support.
+
         Args:
             filepath: Path to the partially downloaded file
             
         Returns:
             Byte position to resume from (0 if starting fresh)
         """
-        if not self.config.resume_downloads:
+        if not self.config.resume_downloads or not self.url_info.supports_resume:
             return 0
         try:
             if await aiofiles.os.path.exists(filepath):
@@ -312,7 +328,7 @@ class AsyncDownloader:
         
         Returns:
             Path to downloaded file, or None if cancelled
-            
+
         Raises:
             Various exceptions after max retries exceeded
         """
@@ -331,16 +347,35 @@ class AsyncDownloader:
 
     async def _download_file(self) -> typing.Optional[str]:
         """
-        Core download implementation.
-        
+        Core download implementation using URLInfo for metadata.
+
         Returns:
             Path to downloaded file, or None if cancelled
-            
+
         Raises:
             aiohttp.ClientResponseError: For HTTP errors
             ValueError: For validation errors
             FileExistsError: When file exists and overwrite is disabled
         """
+        filename = self.url_info.filename or self._get_filename_from_response(await self._make_request())
+
+        valid, error_msg = self._validate_file(self.url_info)
+        if not valid:
+            raise ValueError(error_msg)
+
+        is_dir = await aiofiles.os.path.isdir(self.output_path)
+        if is_dir:
+            self.output_path = join(self.output_path, filename)
+
+        if self.config.auto_create_dirs:
+            try:
+                await aiofiles.os.makedirs(dirname(self.output_path), exist_ok=True)
+            except OSError as e:
+                raise OSError(f"Failed to create directory {dirname(self.output_path)}: {e}")
+
+            if await aiofiles.os.path.exists(self.output_path) and not self.config.overwrite_existing and self.resume_position == 0:
+                raise FileExistsError(f"File already exists: {self.output_path}")
+
         self.resume_position = await self._get_resume_position(self.output_path)
         headers = {"Range": f"bytes={self.resume_position}-"} if self.resume_position > 0 else {}
 
@@ -352,33 +387,15 @@ class AsyncDownloader:
                     status=response.status
                 )
 
-            filename = self._get_filename_from_response(response)
-            content_type = response.headers.get("Content-Type", "")
-            
-            valid, error_msg = self._validate_file(filename, content_type)
-            if not valid:
-                raise ValueError(error_msg)
-
-            is_dir = await aiofiles.os.path.isdir(self.output_path)
-            if is_dir:
-                self.output_path = join(self.output_path, filename)
-            
-            if self.config.auto_create_dirs:
-                try:
-                    await aiofiles.os.makedirs(dirname(self.output_path), exist_ok=True)
-                except OSError as e:
-                    raise OSError(f"Failed to create directory {dirname(self.output_path)}: {e}")
-
-            if await aiofiles.os.path.exists(self.output_path) and not self.config.overwrite_existing and self.resume_position == 0:
-                raise FileExistsError(f"File already exists: {self.output_path}")
-
-            content_length = response.headers.get("Content-Length")
-            if content_length:
-                self.total_bytes = int(content_length)
-                if response.status == 206:
-                    content_range = response.headers.get("Content-Range", "")
-                    if "/" in content_range:
-                        self.total_bytes = int(content_range.split("/")[-1])
+            self.total_bytes = self.url_info.size or 0
+            if self.total_bytes == 0:
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    self.total_bytes = int(content_length)
+                    if response.status == 206:
+                        content_range = response.headers.get("Content-Range", "")
+                        if "/" in content_range:
+                            self.total_bytes = int(content_range.split("/")[-1])
 
             mode = "ab" if self.resume_position > 0 else "wb"
             self.downloaded_bytes = self.resume_position
@@ -478,7 +495,7 @@ class DownloadManager:
         >>> manager.resume_download(id1)
         >>> manager.cancel_download(id2)
     """
-    
+
     def __init__(self, max_concurrent: int = 5):
         """
         Initialize the download manager.
@@ -521,10 +538,10 @@ class DownloadManager:
             ... )
         """
         download_id = download_id or f"download_{len(self.downloads)}"
-        
+
         downloader = AsyncDownloader(url, output_path, config, progress_callback)
         self.downloads[download_id] = downloader
-        
+
         return download_id
 
     async def start_download(self, download_id: str) -> typing.Optional[str]:
@@ -544,7 +561,7 @@ class DownloadManager:
             raise ValueError(f"Download {download_id} not found")
 
         downloader = self.downloads[download_id]
-        
+
         async with self.semaphore:
             async with downloader:
                 return await downloader.start()
