@@ -1,4 +1,4 @@
-from aioprogress import AsyncDownloader
+from aioprogress import AsyncDownloader, Progress
 import asyncio
 
 
@@ -8,7 +8,7 @@ async def main():
     # its unusual, because its aioprogress ... :)
     # but maybe you do not like progress
     # so, you can do something like this:
-    async with AsyncDownloader(url, './downloads', progress_callback=lambda: None) as downloader:
+    async with AsyncDownloader(url, './downloads', progress_callback=Progress.NONE) as downloader:
         filename = await downloader.download()
         print(filename)
 
