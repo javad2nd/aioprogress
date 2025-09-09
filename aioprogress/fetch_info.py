@@ -20,6 +20,8 @@ class FetchMethod(Enum):
         URL_PARSING: From URL path analysis
         CONTENT_SNIFFING: From actual content analysis
         MIME_DATABASE: From system MIME type database
+        EXTENSION_OVERRIDE: Override generic MIME based on file extension
+        MAGIC_BYTES: Detection using file signature magic bytes
     """
     HEAD_REQUEST = "head_request"
     PARTIAL_GET = "partial_get"
@@ -27,6 +29,8 @@ class FetchMethod(Enum):
     URL_PARSING = "url_parsing"
     CONTENT_SNIFFING = "content_sniffing"
     MIME_DATABASE = "mime_database"
+    EXTENSION_OVERRIDE = "extension_override"
+    MAGIC_BYTES = "magic_bytes"
 
 
 @dataclass
@@ -50,6 +54,7 @@ class URLInfo:
         headers: All response headers received
         redirect_url: Final URL after redirects (if any)
         status_code: HTTP status code received
+        confidence_score: Confidence level of MIME type detection (0.0-1.0)
     """
     url: str
     filename: typing.Optional[str] = None
@@ -66,6 +71,7 @@ class URLInfo:
     headers: dict = field(default_factory=dict)
     redirect_url: typing.Optional[str] = None
     status_code: typing.Optional[int] = None
+    confidence_score: float = 0.0
 
 
 @dataclass
@@ -82,34 +88,39 @@ class FetchConfig:
         use_partial_get: Whether to try partial GET request
         partial_size: Size of partial content to fetch for analysis (bytes)
         enable_content_sniffing: Whether to analyze actual content
+        enable_magic_bytes: Whether to use magic byte signatures for detection
         validate_ssl: Whether to validate SSL certificates
         proxy_url: HTTP/HTTPS/SOCKS proxy URL
         proxy_auth: Proxy authentication tuple
         trust_env: Whether to trust environment proxy settings
         libmagic_available: Whether python-magic is available for content sniffing
+        force_extension_detection: Override generic MIME types with extension-based detection
 
     Example:
         >>> config = FetchConfig(
         ...     timeout=aiohttp.ClientTimeout(total=30),
-        ...     user_agent='URLInfoFetcher/1.0',
+        ...     user_agent='URLInfoFetcher/2.0',
         ...     use_head_request=True,
         ...     enable_content_sniffing=True,
-        ...     partial_size=8192
+        ...     enable_magic_bytes=True,
+        ...     partial_size=16384
         ... )
     """
     timeout: aiohttp.ClientTimeout = field(default_factory=lambda: aiohttp.ClientTimeout(total=30))
     max_redirects: int = 10
-    user_agent: str = "URLInfoFetcher/1.0"
+    user_agent: str = "URLInfoFetcher/2.0"
     headers: dict = field(default_factory=dict)
     use_head_request: bool = True
     use_partial_get: bool = True
-    partial_size: int = 8192
+    partial_size: int = 16384
     enable_content_sniffing: bool = True
+    enable_magic_bytes: bool = True
     validate_ssl: bool = True
     proxy_url: typing.Optional[str] = None
     proxy_auth: typing.Optional[typing.Tuple[str, str]] = None
     trust_env: bool = True
     libmagic_available: bool = field(init=False)
+    force_extension_detection: bool = True
 
     def __post_init__(self):
         """Check if python-magic is available for content sniffing."""
@@ -133,7 +144,9 @@ class URLInfoFetcher:
     3. Content-Disposition header parsing
     4. URL path analysis and parsing
     5. Content sniffing with libmagic (if available)
-    6. System MIME type database lookup
+    6. Magic byte signature detection
+    7. Extension-based MIME override for generic types
+    8. System MIME type database lookup
 
     Args:
         config: Configuration options for fetching behavior
@@ -151,6 +164,7 @@ class URLInfoFetcher:
         >>> config = FetchConfig(
         ...     use_head_request=True,
         ...     enable_content_sniffing=True,
+        ...     enable_magic_bytes=True,
         ...     proxy_url='http://proxy.example.com:8080'
         ... )
         >>> fetcher = URLInfoFetcher(config)
@@ -164,6 +178,79 @@ class URLInfoFetcher:
         ...     for url, info in results.items():
         ...         print(f"{url}: {info.filename} ({info.size} bytes)")
     """
+
+    MAGIC_BYTES_SIGNATURES = {
+        b'\x1A\x45\xDF\xA3': ('video/webm', 'webm', 1.0),
+        b'\x00\x00\x00\x18ftypmp4': ('video/mp4', 'mp4', 1.0),
+        b'\x00\x00\x00\x20ftypiso': ('video/mp4', 'mp4', 0.9),
+        b'ftypisom': ('video/mp4', 'mp4', 0.9),
+        b'ftypM4V': ('video/mp4', 'mp4', 0.9),
+        b'ftypmp42': ('video/mp4', 'mp4', 0.9),
+        b'\x00\x00\x00\x14ftypqt': ('video/quicktime', 'mov', 1.0),
+        b'RIFF': ('video/avi', 'avi', 0.8),
+        b'FLV\x01': ('video/x-flv', 'flv', 1.0),
+        b'\x47\x40': ('video/mp2t', 'ts', 0.7),
+        b'OggS': ('application/ogg', 'ogg', 0.9),
+        b'\xFF\xFB': ('audio/mpeg', 'mp3', 0.8),
+        b'\xFF\xF3': ('audio/mpeg', 'mp3', 0.8),
+        b'\xFF\xF2': ('audio/mpeg', 'mp3', 0.8),
+        b'ID3': ('audio/mpeg', 'mp3', 0.9),
+        b'RIFF': ('audio/wav', 'wav', 0.7),
+        b'fLaC': ('audio/flac', 'flac', 1.0),
+        b'\x89PNG\r\n\x1a\n': ('image/png', 'png', 1.0),
+        b'\xFF\xD8\xFF': ('image/jpeg', 'jpg', 1.0),
+        b'GIF87a': ('image/gif', 'gif', 1.0),
+        b'GIF89a': ('image/gif', 'gif', 1.0),
+        b'BM': ('image/bmp', 'bmp', 0.9),
+        b'RIFF': ('image/webp', 'webp', 0.7),
+        b'%PDF': ('application/pdf', 'pdf', 1.0),
+        b'PK\x03\x04': ('application/zip', 'zip', 0.8),
+        b'PK\x05\x06': ('application/zip', 'zip', 0.8),
+        b'PK\x07\x08': ('application/zip', 'zip', 0.8),
+        b'Rar!\x1a\x07\x00': ('application/x-rar-compressed', 'rar', 1.0),
+        b'\x37\x7A\xBC\xAF\x27\x1C': ('application/x-7z-compressed', '7z', 1.0),
+        b'\x1f\x8b\x08': ('application/gzip', 'gz', 1.0),
+        b'MZ': ('application/x-msdownload', 'exe', 0.8),
+        b'\x7fELF': ('application/x-executable', 'elf', 1.0),
+        b'\xca\xfe\xba\xbe': ('application/java-vm', 'class', 1.0),
+    }
+
+    EXTENSION_MIME_OVERRIDE = {
+        'mkv': 'video/x-matroska',
+        'webm': 'video/webm',
+        'mp4': 'video/mp4',
+        'avi': 'video/x-msvideo',
+        'mov': 'video/quicktime',
+        'wmv': 'video/x-ms-wmv',
+        'flv': 'video/x-flv',
+        'mpg': 'video/mpeg',
+        'mpeg': 'video/mpeg',
+        '3gp': 'video/3gpp',
+        'ts': 'video/mp2t',
+        'm4v': 'video/mp4',
+        'mp3': 'audio/mpeg',
+        'wav': 'audio/wav',
+        'flac': 'audio/flac',
+        'aac': 'audio/aac',
+        'ogg': 'audio/ogg',
+        'wma': 'audio/x-ms-wma',
+        'm4a': 'audio/mp4',
+        'opus': 'audio/opus',
+        'zip': 'application/zip',
+        'rar': 'application/x-rar-compressed',
+        '7z': 'application/x-7z-compressed',
+        'tar': 'application/x-tar',
+        'gz': 'application/gzip',
+        'bz2': 'application/x-bzip2',
+        'exe': 'application/x-msdownload',
+        'msi': 'application/x-msi',
+        'deb': 'application/x-debian-package',
+        'rpm': 'application/x-rpm',
+        'dmg': 'application/x-apple-diskimage',
+        'iso': 'application/x-iso9660-image',
+        'torrent': 'application/x-bittorrent',
+        'apk': 'application/vnd.android.package-archive',
+    }
 
     def __init__(self, config: FetchConfig = None):
         """
@@ -306,7 +393,7 @@ class URLInfoFetcher:
 
     def _get_mime_from_extension(self, extension: str) -> typing.Optional[str]:
         """
-        Get MIME type from file extension using system database.
+        Get MIME type from file extension using system database and custom overrides.
 
         Args:
             extension: File extension (without dot)
@@ -316,6 +403,11 @@ class URLInfoFetcher:
         """
         if not extension:
             return None
+
+        extension = extension.lower()
+
+        if extension in self.EXTENSION_MIME_OVERRIDE:
+            return self.EXTENSION_MIME_OVERRIDE[extension]
 
         mime_type, _ = mimetypes.guess_type(f"file.{extension}")
         return mime_type
@@ -344,6 +436,35 @@ class URLInfoFetcher:
 
         return mime_type, charset
 
+    def _detect_mime_from_magic_bytes(self, content: bytes) -> typing.Tuple[
+        typing.Optional[str], typing.Optional[str], float]:
+        """
+        Detect MIME type using magic byte signatures.
+
+        Args:
+            content: Binary content to analyze
+
+        Returns:
+            Tuple of (mime_type, extension, confidence_score)
+        """
+        if not content or not self.config.enable_magic_bytes:
+            return None, None, 0.0
+
+        for signature, (mime_type, extension, confidence) in self.MAGIC_BYTES_SIGNATURES.items():
+            if content.startswith(signature):
+                return mime_type, extension, confidence
+
+        for signature in [b'RIFF']:
+            if content.startswith(signature):
+                if b'WEBPVP8' in content[:20]:
+                    return 'image/webp', 'webp', 0.9
+                elif b'AVI ' in content[:12]:
+                    return 'video/avi', 'avi', 0.9
+                elif b'WAVE' in content[:12]:
+                    return 'audio/wav', 'wav', 0.9
+
+        return None, None, 0.0
+
     def _analyze_content_with_magic(self, content: bytes) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
         """
         Analyze content using python-magic library.
@@ -365,6 +486,31 @@ class URLInfoFetcher:
             return mime_type, description
         except Exception:
             return None, None
+
+    def _should_override_generic_mime(self, mime_type: str, extension: str) -> bool:
+        """
+        Determine if a generic MIME type should be overridden based on file extension.
+
+        Args:
+            mime_type: Current MIME type
+            extension: File extension
+
+        Returns:
+            True if MIME type should be overridden
+        """
+        generic_mimes = {
+            'application/octet-stream',
+            'application/binary',
+            'binary/octet-stream',
+            'application/unknown',
+            'unknown/unknown'
+        }
+
+        return (
+                self.config.force_extension_detection and
+                mime_type in generic_mimes and
+                extension in self.EXTENSION_MIME_OVERRIDE
+        )
 
     def _guess_filename_from_mime(self, mime_type: str, url: str) -> typing.Optional[str]:
         """
@@ -391,6 +537,7 @@ class URLInfoFetcher:
             'image/gif': 'gif',
             'video/mp4': 'mp4',
             'video/webm': 'webm',
+            'video/x-matroska': 'mkv',
             'audio/mpeg': 'mp3',
             'audio/wav': 'wav',
         }
@@ -443,6 +590,7 @@ class URLInfoFetcher:
                     info.fetch_methods.add(FetchMethod.CONTENT_DISPOSITION)
 
                 info.fetch_methods.add(FetchMethod.HEAD_REQUEST)
+                info.confidence_score = 0.5 if info.mime_type else 0.0
                 return info, True
 
         except Exception:
@@ -450,7 +598,7 @@ class URLInfoFetcher:
 
     async def _try_partial_get(self, url: str, existing_info: URLInfo) -> typing.Tuple[URLInfo, bool]:
         """
-        Try to fetch additional info using partial GET request.
+        Try to fetch additional info using partial GET request with enhanced MIME detection.
 
         Args:
             url: URL to analyze
@@ -471,11 +619,22 @@ class URLInfoFetcher:
 
                 content = await response.read()
 
-                if content and self.config.enable_content_sniffing:
-                    mime_type, description = self._analyze_content_with_magic(content)
-                    if mime_type and not existing_info.mime_type:
-                        existing_info.mime_type = mime_type
-                        existing_info.fetch_methods.add(FetchMethod.CONTENT_SNIFFING)
+                if content:
+                    magic_mime, magic_ext, magic_confidence = self._detect_mime_from_magic_bytes(content)
+
+                    if magic_mime and magic_confidence > existing_info.confidence_score:
+                        existing_info.mime_type = magic_mime
+                        if magic_ext and not existing_info.extension:
+                            existing_info.extension = magic_ext
+                        existing_info.confidence_score = magic_confidence
+                        existing_info.fetch_methods.add(FetchMethod.MAGIC_BYTES)
+
+                    if self.config.enable_content_sniffing:
+                        libmagic_mime, description = self._analyze_content_with_magic(content)
+                        if libmagic_mime and not existing_info.mime_type:
+                            existing_info.mime_type = libmagic_mime
+                            existing_info.confidence_score = 0.8
+                            existing_info.fetch_methods.add(FetchMethod.CONTENT_SNIFFING)
 
                 if response.status == 206:
                     content_range = response.headers.get('Content-Range', '')
@@ -492,29 +651,32 @@ class URLInfoFetcher:
 
     async def fetch_info(self, url: str) -> URLInfo:
         """
-        Fetch comprehensive information about a URL.
+        Fetch comprehensive information about a URL with enhanced MIME type detection.
 
         Uses multiple detection methods in order of efficiency and reliability:
         1. HTTP HEAD request for headers
         2. URL parsing for filename extraction
         3. Partial GET request for content analysis
-        4. MIME database lookup
+        4. Magic byte signature detection
+        5. Extension-based MIME override for generic types
+        6. System MIME database lookup
 
         Args:
             url: URL to analyze
 
         Returns:
-            URLInfo object with all gathered information
+            URLInfo object with all gathered information and confidence score
 
         Raises:
             RuntimeError: If no session is available (use async context manager)
 
         Example:
             >>> async with fetcher:
-            ...     info = await fetcher.fetch_info("https://example.com/video.mp4")
+            ...     info = await fetcher.fetch_info("https://example.com/video.mkv")
             ...     print(f"Filename: {info.filename}")
             ...     print(f"Size: {info.size} bytes")
             ...     print(f"MIME type: {info.mime_type}")
+            ...     print(f"Confidence: {info.confidence_score}")
             ...     print(f"Supports resume: {info.supports_resume}")
         """
         if not self.session:
@@ -538,11 +700,17 @@ class URLInfoFetcher:
         if info.filename and not info.extension:
             info.extension = self._get_extension_from_filename(info.filename)
 
-        if info.extension and not info.mime_type:
-            mime_from_ext = self._get_mime_from_extension(info.extension)
-            if mime_from_ext:
-                info.mime_type = mime_from_ext
+        if info.extension:
+            extension_mime = self._get_mime_from_extension(info.extension)
+
+            if not info.mime_type:
+                info.mime_type = extension_mime
+                info.confidence_score = 0.7
                 info.fetch_methods.add(FetchMethod.MIME_DATABASE)
+            elif self._should_override_generic_mime(info.mime_type, info.extension):
+                info.mime_type = extension_mime
+                info.confidence_score = 0.9
+                info.fetch_methods.add(FetchMethod.EXTENSION_OVERRIDE)
 
         if not info.filename and info.mime_type:
             info.filename = self._guess_filename_from_mime(info.mime_type, url)
