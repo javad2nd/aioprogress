@@ -4,7 +4,7 @@ Supports resume downloads, progress tracking, cancellation, proxy support,
 and concurrent downloads.
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.5.1"
 
 from .downloader import DownloadState, DownloadConfig, AsyncDownloader, DownloadManager
 from .progress import Progress, ProgressData
