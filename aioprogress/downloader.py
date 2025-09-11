@@ -7,38 +7,24 @@ import aiohttp
 import aiofiles
 import aiofiles.os
 from dataclasses import dataclass, field
-from enum import Enum
 from .progress import Progress
 from .fetch_info import URLInfoFetcher, FetchConfig, URLInfo
+from .events import (
+    DownloadStartEvent, DownloadCancelledEvent, DownloadCompleteEvent, DownloadFailureEvent,
+    DownloadPausedEvent, DownloadResumedEvent,
+    DownloadValidationEvent, DownloadRetryEvent, DownloadTimeoutEvent,
+    DownloadState, DownloadEvent
+)
+from time import time
 
-class DownloadState(Enum):
-    """
-    Enumeration of possible download states.
-    
-    States:
-        UNDEFINED: Download State is undefined
-        PENDING: Download is queued but not started
-        DOWNLOADING: Download is actively in progress
-        PAUSED: Download is temporarily paused
-        COMPLETED: Download finished successfully
-        CANCELLED: Download was cancelled by user
-        FAILED: Download failed due to error
-    """
-    UNDEFINED = "undefined"
-    PENDING = "pending"
-    DOWNLOADING = "downloading"
-    PAUSED = "paused"
-    COMPLETED = "completed"
-    CANCELLED = "cancelled"
-    FAILED = "failed"
 
 @dataclass
 class DownloadConfig:
     """
     Configuration class for download behavior and parameters.
-    
+
     Attributes:
-        chunk_size: Size of data chunks to read at once (bytes)
+        chunk_size: Size of data chunks to read at once (bytes). Use -1 to read all available data as soon as it is received, with no chunking limit.
         timeout: HTTP client timeout configuration
         max_retries: Maximum number of retry attempts on failure
         retry_delay: Base delay between retries (exponential backoff)
@@ -56,7 +42,7 @@ class DownloadConfig:
         proxy_auth: Proxy authentication (username, password) tuple
         proxy_headers: Additional headers to send to proxy
         trust_env: Whether to trust environment variables for proxy configuration
-        
+
     Example:
         >>> config = DownloadConfig(
         ...     chunk_size=16384,
@@ -67,7 +53,7 @@ class DownloadConfig:
         ...     proxy_auth=('username', 'password')
         ... )
     """
-    chunk_size: int = 8192
+    chunk_size: int = -1
     timeout: aiohttp.ClientTimeout = field(default_factory=lambda: aiohttp.ClientTimeout(total=300))
     max_retries: int = 3
     retry_delay: float = 1.0
@@ -86,9 +72,10 @@ class DownloadConfig:
     proxy_headers: dict = field(default_factory=dict)
     trust_env: bool = True
 
+
 class AsyncDownloader:
     """
-    High-performance async file downloader with resume capability and proxy support.
+    High-performance async file downloader with resume capability, proxy support, and comprehensive event handling.
     
     Supports downloading files from HTTP/HTTPS URLs with features like:
     - Resume interrupted downloads
@@ -99,6 +86,7 @@ class AsyncDownloader:
     - SSL validation control
     - HTTP/HTTPS/SOCKS proxy support
     - Environment proxy configuration
+    - Comprehensive event system for monitoring download lifecycle
     
     Args:
         url: URL to download from
@@ -106,54 +94,89 @@ class AsyncDownloader:
         config: Download configuration options
         progress_callback: Function to call with progress updates
         
+    Event Handlers:
+        All event handlers are optional and receive the corresponding event object as parameter.
+        - on_start: Called when download begins
+        - on_complete: Called when download finishes successfully
+        - on_failure: Called when download fails (before retry)
+        - on_timeout: Called when download times out
+        - on_retry: Called when download is being retried
+        - on_cancel: Called when download is cancelled
+        - on_pause: Called when download is paused
+        - on_resume: Called when download is resumed
+        - on_validation: Called when file validation occurs
+
     Example:
-        >>> # Basic usage
+        >>> # Basic usage with event handlers
         >>> from aioprogress import ProgressData
+        >>> import time
         >>>
         >>> async def progress_cb(data: ProgressData):
         ...     print(f"{data.progress:.1f}% at {data.speed_human_readable}")
-        >>> 
+        >>>
+        >>> async def on_failure(event: DownloadFailureEvent):
+        ...     print(f"Download failed: {event.error}, attempt {event.attempt}")
+        >>>
+        >>> async def on_retry(event: DownloadRetryEvent):
+        ...     print(f"Retrying download in {event.delay}s (attempt {event.attempt}/{event.max_attempts})")
+        >>>
         >>> async with AsyncDownloader(
         ...     "https://example.com/video.mp4",
         ...     "./downloads/",
-        ...     progress_callback=progress_cb
+        ...     progress_callback=progress_cb,
+        ...     on_failure=on_failure,
+        ...     on_retry=on_retry
         ... ) as downloader:
         ...     file_path = await downloader.start()
         ...     print(f"Downloaded to: {file_path}")
-        
-        >>> # With HTTP proxy
+
+        >>> # With HTTP proxy and comprehensive event handling
         >>> config = DownloadConfig(
         ...     proxy_url='http://proxy.example.com:8080',
         ...     proxy_auth=('username', 'password'),
         ...     proxy_headers={'User-Agent': 'CustomAgent/1.0'}
         ... )
-        >>> async with AsyncDownloader(url, path, config) as downloader:
-        ...     await downloader.start()
-        
-        >>> # With SOCKS proxy (requires aiohttp-socks)
-        >>> config = DownloadConfig(
-        ...     proxy_url='socks5://127.0.0.1:1080',
-        ...     proxy_auth=('user', 'pass')
-        ... )
-        >>> async with AsyncDownloader(url, path, config) as downloader:
+        >>>
+        >>> async def on_timeout(event: DownloadTimeoutEvent):
+        ...     print(f"Timeout occurred: {event.timeout_type}")
+        >>>
+        >>> async with AsyncDownloader(url, path, config, on_timeout=on_timeout) as downloader:
         ...     await downloader.start()
     """
 
     def __init__(
-        self,
-        url: str,
-        output_path: str,
-        config: DownloadConfig = None,
-        progress_callback: typing.Optional[callable] = None
+            self,
+            url: str,
+            output_path: str,
+            config: DownloadConfig = None,
+            progress_callback: typing.Optional[callable] = None,
+            on_start: typing.Optional[typing.Callable[[DownloadStartEvent], typing.Awaitable[None]]] = None,
+            on_complete: typing.Optional[typing.Callable[[DownloadCompleteEvent], typing.Awaitable[None]]] = None,
+            on_failure: typing.Optional[typing.Callable[[DownloadFailureEvent], typing.Awaitable[None]]] = None,
+            on_timeout: typing.Optional[typing.Callable[[DownloadTimeoutEvent], typing.Awaitable[None]]] = None,
+            on_retry: typing.Optional[typing.Callable[[DownloadRetryEvent], typing.Awaitable[None]]] = None,
+            on_cancel: typing.Optional[typing.Callable[[DownloadCancelledEvent], typing.Awaitable[None]]] = None,
+            on_pause: typing.Optional[typing.Callable[[DownloadPausedEvent], typing.Awaitable[None]]] = None,
+            on_resume: typing.Optional[typing.Callable[[DownloadResumedEvent], typing.Awaitable[None]]] = None,
+            on_validation: typing.Optional[typing.Callable[[DownloadValidationEvent], typing.Awaitable[None]]] = None
     ):
         """
-        Initialize the downloader.
+        Initialize the downloader with event handlers.
 
         Args:
             url: URL to download from
             output_path: Where to save the file (file or directory path)
             config: Configuration options. Uses defaults if None
             progress_callback: Optional callback for progress updates
+            on_start: Event handler for download start
+            on_complete: Event handler for download completion
+            on_failure: Event handler for download failures
+            on_timeout: Event handler for timeouts
+            on_retry: Event handler for retry attempts
+            on_cancel: Event handler for cancellation
+            on_pause: Event handler for pause events
+            on_resume: Event handler for resume events
+            on_validation: Event handler for file validation
         """
         self.url = url
         self.output_path = output_path
@@ -168,6 +191,46 @@ class AsyncDownloader:
         self.current_task: asyncio.Task = None
         self.resume_position = 0
         self.url_info: URLInfo = None
+        self.start_time: float = 0.0
+
+        self.on_start = on_start
+        self.on_complete = on_complete
+        self.on_failure = on_failure
+        self.on_timeout = on_timeout
+        self.on_retry = on_retry
+        self.on_cancel = on_cancel
+        self.on_pause = on_pause
+        self.on_resume = on_resume
+        self.on_validation = on_validation
+
+    async def _emit_event(self, event: DownloadEvent):
+        """
+        Emit an event to the appropriate handler if it exists.
+
+        Args:
+            event: The event object to emit
+        """
+        handler_map = {
+            DownloadStartEvent: self.on_start,
+            DownloadCompleteEvent: self.on_complete,
+            DownloadFailureEvent: self.on_failure,
+            DownloadTimeoutEvent: self.on_timeout,
+            DownloadRetryEvent: self.on_retry,
+            DownloadCancelledEvent: self.on_cancel,
+            DownloadPausedEvent: self.on_pause,
+            DownloadResumedEvent: self.on_resume,
+            DownloadValidationEvent: self.on_validation,
+        }
+
+        handler = handler_map.get(type(event))
+        if handler and callable(handler):
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(event)
+                else:
+                    handler(event)
+            except:
+                pass
 
     async def __aenter__(self):
         """Async context manager entry. Sets up HTTP session with proxy support."""
@@ -270,7 +333,7 @@ class AsyncDownloader:
         filename = basename(path) if path else "download"
         return filename or "download"
 
-    def _validate_file(self, url_info: URLInfo) -> tuple[bool, str]:
+    async def _validate_file(self, url_info: URLInfo) -> tuple[bool, str]:
         """
         Validate file against configured restrictions using URLInfo metadata.
 
@@ -283,11 +346,39 @@ class AsyncDownloader:
         if self.config.allowed_extensions and url_info.extension:
             ext = url_info.extension.lower()
             if ext not in self.config.allowed_extensions:
+                await self._emit_event(DownloadValidationEvent(
+                    url=self.url,
+                    output_path=self.output_path,
+                    timestamp=time(),
+                    state=self.state,
+                    validation_type="extension",
+                    is_valid=False,
+                    message=f"Extension '{ext}' not allowed"
+                ))
                 return False, f"Extension '{ext}' not allowed"
 
         if self.config.validate_content_type and self.config.expected_content_types and url_info.mime_type:
             if not any(ct in url_info.mime_type for ct in self.config.expected_content_types):
+                await self._emit_event(DownloadValidationEvent(
+                    url=self.url,
+                    output_path=self.output_path,
+                    timestamp=time(),
+                    state=self.state,
+                    validation_type="content_type",
+                    is_valid=False,
+                    message=f"Content type '{url_info.mime_type}' not allowed"
+                ))
                 return False, f"Content type '{url_info.mime_type}' not allowed"
+
+        await self._emit_event(DownloadValidationEvent(
+            url=self.url,
+            output_path=self.output_path,
+            timestamp=time(),
+            state=self.state,
+            validation_type="all",
+            is_valid=True,
+            message="File validation passed"
+        ))
 
         return True, ""
 
@@ -326,7 +417,7 @@ class AsyncDownloader:
 
     async def download(self) -> typing.Optional[str]:
         """
-        Execute the download with retry logic.
+        Execute the download with retry logic and comprehensive event handling.
         
         Returns:
             Path to downloaded file, or None if cancelled
@@ -339,17 +430,66 @@ class AsyncDownloader:
 
         for attempt in range(self.config.max_retries + 1):
             try:
+                if attempt > 0:
+                    self.state = DownloadState.RETRYING
+                    delay = self.config.retry_delay * (2 ** (attempt - 1))
+
+                    await self._emit_event(DownloadRetryEvent(
+                        url=self.url,
+                        output_path=self.output_path,
+                        timestamp=time(),
+                        state=self.state,
+                        attempt=attempt,
+                        max_attempts=self.config.max_retries,
+                        delay=delay,
+                        last_error=getattr(self, '_last_error', None)
+                    ))
+
+                    await asyncio.sleep(delay)
+
                 self.state = DownloadState.DOWNLOADING
                 return await self._download_file()
-            except Exception as e:
+
+            except asyncio.TimeoutError as e:
+                self._last_error = e
+                timeout_type = "total"
+                if hasattr(e, 'args') and e.args:
+                    timeout_type = str(e.args[0]) if "connect" in str(e.args[0]).lower() else "total"
+
+                await self._emit_event(DownloadTimeoutEvent(
+                    url=self.url,
+                    output_path=self.output_path,
+                    timestamp=time(),
+                    state=self.state,
+                    timeout_type=timeout_type,
+                    attempt=attempt + 1,
+                    will_retry=attempt < self.config.max_retries
+                ))
+
                 if attempt == self.config.max_retries:
                     self.state = DownloadState.FAILED
                     raise e
-                await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
+
+            except Exception as e:
+                self._last_error = e
+
+                await self._emit_event(DownloadFailureEvent(
+                    url=self.url,
+                    output_path=self.output_path,
+                    timestamp=time(),
+                    state=self.state,
+                    error=e,
+                    attempt=attempt + 1,
+                    will_retry=attempt < self.config.max_retries
+                ))
+
+                if attempt == self.config.max_retries:
+                    self.state = DownloadState.FAILED
+                    raise e
 
     async def _download_file(self) -> typing.Optional[str]:
         """
-        Core download implementation using URLInfo for metadata.
+        Core download implementation using URLInfo for metadata with event handling.
 
         Returns:
             Path to downloaded file, or None if cancelled
@@ -359,9 +499,11 @@ class AsyncDownloader:
             ValueError: For validation errors
             FileExistsError: When file exists and overwrite is disabled
         """
+        self.start_time = time()
+
         filename = self.url_info.filename or self._get_filename_from_response(await self._make_request())
 
-        valid, error_msg = self._validate_file(self.url_info)
+        valid, error_msg = await self._validate_file(self.url_info)
         if not valid:
             raise ValueError(error_msg)
 
@@ -375,13 +517,17 @@ class AsyncDownloader:
             except OSError as e:
                 raise OSError(f"Failed to create directory {dirname(self.output_path)}: {e}")
 
-            if await aiofiles.os.path.exists(self.output_path) and not self.config.overwrite_existing and self.resume_position == 0:
+            if (
+                    await aiofiles.os.path.exists(self.output_path) and
+                    not self.config.overwrite_existing and
+                    self.resume_position == 0
+            ):
                 raise FileExistsError(f"File already exists: {self.output_path}")
 
         self.resume_position = await self._get_resume_position(self.output_path)
         headers = {"Range": f"bytes={self.resume_position}-"} if self.resume_position > 0 else {}
 
-        async with await self._make_request(headers) as response:
+        async with (await self._make_request(headers) as response):
             if response.status not in (200, 206):
                 raise aiohttp.ClientResponseError(
                     request_info=response.request_info,
@@ -399,13 +545,34 @@ class AsyncDownloader:
                         if "/" in content_range:
                             self.total_bytes = int(content_range.split("/")[-1])
 
+            await self._emit_event(DownloadStartEvent(
+                url=self.url,
+                output_path=self.output_path,
+                timestamp=time(),
+                state=self.state,
+                total_bytes=self.total_bytes
+            ))
+
             mode = "ab" if self.resume_position > 0 else "wb"
             self.downloaded_bytes = self.resume_position
 
             async with aiofiles.open(self.output_path, mode) as f:
-                async for chunk in response.content.iter_chunked(self.config.chunk_size):
+                chunks = (
+                    response.content.iter_chunked(self.config.chunk_size)
+                    if self.config.chunk_size > 0
+                    else response.content.iter_any()
+                )
+
+                async for chunk in chunks:
                     if self.cancel_event.is_set():
                         self.state = DownloadState.CANCELLED
+                        await self._emit_event(DownloadCancelledEvent(
+                            url=self.url,
+                            output_path=self.output_path,
+                            timestamp=time(),
+                            state=self.state,
+                            reason="user_cancelled"
+                        ))
                         return None
 
                     while self.pause_event.is_set():
@@ -416,6 +583,18 @@ class AsyncDownloader:
                     self.progress(self.downloaded_bytes, self.total_bytes)
 
             self.state = DownloadState.COMPLETED
+            file_size = await aiofiles.os.path.getsize(self.output_path) if await aiofiles.os.path.exists(
+                self.output_path) else 0
+
+            await self._emit_event(DownloadCompleteEvent(
+                url=self.url,
+                output_path=self.output_path,
+                timestamp=time(),
+                state=self.state,
+                file_size=file_size,
+                duration=time() - self.start_time
+            ))
+
             return self.output_path
 
     def cancel(self):
@@ -429,7 +608,7 @@ class AsyncDownloader:
         if self.current_task and not self.current_task.done():
             self.current_task.cancel()
 
-    def pause(self):
+    async def pause(self):
         """
         Pause the download.
         
@@ -439,7 +618,15 @@ class AsyncDownloader:
         self.pause_event.set()
         self.state = DownloadState.PAUSED
 
-    def resume(self):
+        await self._emit_event(DownloadPausedEvent(
+            url=self.url,
+            output_path=self.output_path,
+            timestamp=time(),
+            state=self.state,
+            downloaded_bytes=self.downloaded_bytes
+        ))
+
+    async def resume(self):
         """
         Resume a paused download.
         
@@ -447,6 +634,14 @@ class AsyncDownloader:
         """
         self.pause_event.clear()
         self.state = DownloadState.DOWNLOADING
+
+        await self._emit_event(DownloadResumedEvent(
+            url=self.url,
+            output_path=self.output_path,
+            timestamp=time(),
+            state=self.state,
+            resume_position=self.downloaded_bytes
+        ))
 
     async def start(self) -> typing.Optional[str]:
         """
@@ -470,11 +665,19 @@ class AsyncDownloader:
             return await self.current_task
         except asyncio.CancelledError:
             self.state = DownloadState.CANCELLED
+            await self._emit_event(DownloadCancelledEvent(
+                url=self.url,
+                output_path=self.output_path,
+                timestamp=time(),
+                state=self.state,
+                reason="task_cancelled"
+            ))
             return None
+
 
 class DownloadManager:
     """
-    Manages multiple concurrent downloads with centralized control.
+    Manages multiple concurrent downloads with centralized control and event handling.
     
     Provides batch operations, concurrency limiting, and state tracking
     for multiple downloads. Useful for download queues and bulk operations.
@@ -485,16 +688,23 @@ class DownloadManager:
     Example:
         >>> manager = DownloadManager(max_concurrent=3)
         >>> 
-        >>> # Add downloads
-        >>> id1 = await manager.add_download("https://example.com/file1.zip", "./downloads/")
+        >>> # Add downloads with event handlers
+        >>> async def on_failure(event):
+        ...     print(f"Download failed: {event.error}")
+        >>>
+        >>> id1 = await manager.add_download(
+        ...     "https://example.com/file1.zip",
+        ...     "./downloads/",
+        ...     on_failure=on_failure
+        ... )
         >>> id2 = await manager.add_download("https://example.com/file2.zip", "./downloads/")
         >>> 
         >>> # Start all downloads
         >>> results = await manager.start_all()
         >>> 
         >>> # Control individual downloads
-        >>> manager.pause_download(id1)
-        >>> manager.resume_download(id1)
+        >>> await manager.pause_download(id1)
+        >>> await manager.resume_download(id1)
         >>> manager.cancel_download(id2)
     """
 
@@ -510,15 +720,16 @@ class DownloadManager:
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
     async def add_download(
-        self,
-        url: str,
-        output_path: str,
-        config: DownloadConfig = None,
-        progress_callback: typing.Optional[callable] = None,
-        download_id: str = None
+            self,
+            url: str,
+            output_path: str,
+            config: DownloadConfig = None,
+            progress_callback: typing.Optional[callable] = None,
+            download_id: str = None,
+            **event_handlers
     ) -> str:
         """
-        Add a download to the manager.
+        Add a download to the manager with event handlers.
         
         Args:
             url: URL to download from
@@ -526,22 +737,35 @@ class DownloadManager:
             config: Download configuration options
             progress_callback: Function to call with progress updates
             download_id: Unique identifier for this download (auto-generated if None)
+            **event_handlers: Event handler functions (on_start, on_complete, on_failure, etc.)
             
         Returns:
             Unique download ID for managing this download
             
         Example:
             >>> config = DownloadConfig(max_retries=5)
+            >>>
+            >>> async def on_failure(event):
+            ...     print(f"Download failed: {event.error}")
+            >>>
             >>> download_id = await manager.add_download(
             ...     "https://example.com/large_file.zip",
             ...     "./downloads/",
             ...     config=config,
-            ...     download_id="my_download"
+            ...     download_id="my_download",
+            ...     on_failure=on_failure,
+            ...     on_retry=lambda e: print(f"Retrying... attempt {e.attempt}")
             ... )
         """
         download_id = download_id or f"download_{len(self.downloads)}"
 
-        downloader = AsyncDownloader(url, output_path, config, progress_callback)
+        downloader = AsyncDownloader(
+            url,
+            output_path,
+            config,
+            progress_callback,
+            **event_handlers
+        )
         self.downloads[download_id] = downloader
 
         return download_id
@@ -612,7 +836,7 @@ class DownloadManager:
         if download_id in self.downloads:
             self.downloads[download_id].cancel()
 
-    def pause_download(self, download_id: str):
+    async def pause_download(self, download_id: str):
         """
         Pause a specific download.
         
@@ -620,9 +844,9 @@ class DownloadManager:
             download_id: ID of the download to pause
         """
         if download_id in self.downloads:
-            self.downloads[download_id].pause()
+            await self.downloads[download_id].pause()
 
-    def resume_download(self, download_id: str):
+    async def resume_download(self, download_id: str):
         """
         Resume a paused download.
         
@@ -630,7 +854,7 @@ class DownloadManager:
             download_id: ID of the download to resume
         """
         if download_id in self.downloads:
-            self.downloads[download_id].resume()
+            await self.downloads[download_id].resume()
 
     def get_download_state(self, download_id: str) -> DownloadState:
         """
@@ -640,11 +864,46 @@ class DownloadManager:
             download_id: ID of the download to check
             
         Returns:
-            Current download state, or None if download not found
+            Current download state, or UNDEFINED if download not found
         """
         if download_id in self.downloads:
             return self.downloads[download_id].state
         return DownloadState.UNDEFINED
+
+    def get_download_progress(self, download_id: str) -> dict:
+        """
+        Get progress information for a specific download.
+
+        Args:
+            download_id: ID of the download to check
+
+        Returns:
+            Dictionary with progress information or empty dict if not found
+        """
+        if download_id in self.downloads:
+            downloader = self.downloads[download_id]
+            return {
+                'downloaded_bytes': downloader.downloaded_bytes,
+                'total_bytes': downloader.total_bytes,
+                'progress_percent': (downloader.downloaded_bytes / downloader.total_bytes * 100)
+                if downloader.total_bytes > 0 else 0,
+                'state': downloader.state.value,
+                'url': downloader.url,
+                'output_path': downloader.output_path
+            }
+        return {}
+
+    def get_all_downloads_status(self) -> dict[str, dict]:
+        """
+        Get status information for all downloads.
+
+        Returns:
+            Dictionary mapping download IDs to their progress information
+        """
+        return {
+            download_id: self.get_download_progress(download_id)
+            for download_id in self.downloads
+        }
 
     def remove_download(self, download_id: str):
         """
@@ -657,4 +916,39 @@ class DownloadManager:
         """
         if download_id in self.downloads:
             self.downloads[download_id].cancel()
+            del self.downloads[download_id]
+
+    async def cancel_all(self):
+        """
+        Cancel all active downloads.
+        """
+        for downloader in self.downloads.values():
+            downloader.cancel()
+
+    async def pause_all(self):
+        """
+        Pause all active downloads.
+        """
+        for downloader in self.downloads.values():
+            if downloader.state == DownloadState.DOWNLOADING:
+                await downloader.pause()
+
+    async def resume_all(self):
+        """
+        Resume all paused downloads.
+        """
+        for downloader in self.downloads.values():
+            if downloader.state == DownloadState.PAUSED:
+                await downloader.resume()
+
+    def clear_completed(self):
+        """
+        Remove all completed, failed, and cancelled downloads from tracking.
+        """
+        completed_states = {DownloadState.COMPLETED, DownloadState.FAILED, DownloadState.CANCELLED}
+        to_remove = [
+            download_id for download_id, downloader in self.downloads.items()
+            if downloader.state in completed_states
+        ]
+        for download_id in to_remove:
             del self.downloads[download_id]
