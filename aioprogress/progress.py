@@ -1,6 +1,6 @@
-import time
-import inspect
-import typing
+from time import time
+from inspect import iscoroutinefunction
+from typing import Optional
 import asyncio
 from dataclasses import dataclass
 
@@ -25,8 +25,8 @@ class ProgressData:
         elapsed_human_readable: Human-readable elapsed time (e.g., "1m 30s")
         eta_human_readable: Human-readable ETA (e.g., "5m 20s")
     """
-    current: int
-    total: int
+    current: float
+    total: float
     speed: float
     elapsed: float
     eta: float
@@ -80,12 +80,14 @@ class Progress:
     """
 
     NONE = lambda x: None
+    kwargs: dict = dict()
 
     def __init__(
             self,
-            callback: typing.Optional[callable] = None,
+            callback: Optional[callable] = None,
             interval: float = 1.0,
-            loop: asyncio.AbstractEventLoop = None
+            loop: asyncio.AbstractEventLoop = None,
+            **kwargs,
     ) -> None:
         """
         Initialize the progress tracker.
@@ -101,8 +103,9 @@ class Progress:
         self.last_edit: float = 0
         self.last_bytes: float = 0
         self.loop = loop or asyncio.get_event_loop()
+        self.kwargs = kwargs or dict()
 
-    def __call__(self, current: int, total: int) -> None:
+    def __call__(self, current: float, total: float) -> None:
         """
         Update progress with current download status.
 
@@ -113,7 +116,7 @@ class Progress:
             current: Bytes downloaded so far
             total: Total bytes to download (0 if unknown)
         """
-        now = time.time()
+        now = time()
         self.start_time = self.start_time or now
 
         if now - self.last_edit < self.interval and current != total:
@@ -145,13 +148,22 @@ class Progress:
             eta_human_readable=eta_str,
         )
 
-        if inspect.iscoroutinefunction(self.callback):
-            self.loop.create_task(self.callback(datas))
+        if iscoroutinefunction(self.callback):
+            self.loop.create_task(self.callback(datas, **self.kwargs))
         else:
-            self.callback(datas)
+            self.callback(datas, **self.kwargs)
 
         self.last_bytes = current
 
     def default(self, progress: ProgressData):
         """Default progress callback that prints percentage."""
         print(progress)
+
+    def update(self, **kwargs):
+        self.kwargs.update(kwargs)
+
+    def get(self, item, default=None):
+        return self.kwargs.get(item, default)
+
+    def set(self, key, value):
+        self.kwargs.update({key: value})

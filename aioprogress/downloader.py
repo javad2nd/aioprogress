@@ -50,6 +50,7 @@ class DownloadConfig:
         validate_content_type: Whether to validate response content type
         expected_content_types: Set of expected content type prefixes
         progress_interval: Minimum time between progress updates (seconds)
+        progress_kwargs: Progress object kwargs
         auto_create_dirs: Whether to automatically create output directories
         proxy_url: HTTP/HTTPS/SOCKS proxy URL (e.g., 'http://proxy.example.com:8080')
         proxy_auth: Proxy authentication (username, password) tuple
@@ -78,6 +79,7 @@ class DownloadConfig:
     validate_content_type: bool = False
     expected_content_types: set = field(default_factory=set)
     progress_interval: float = 1.0
+    progress_kwargs: dict = field(default_factory=dict)
     auto_create_dirs: bool = True
     proxy_url: typing.Optional[str] = None
     proxy_auth: typing.Optional[typing.Tuple[str, str]] = None
@@ -156,7 +158,7 @@ class AsyncDownloader:
         self.url = url
         self.output_path = output_path
         self.config = config or DownloadConfig()
-        self.progress = Progress(progress_callback, self.config.progress_interval)
+        self.progress = Progress(progress_callback, self.config.progress_interval, **self.config.progress_kwargs)
         self.state = DownloadState.PENDING
         self.downloaded_bytes = 0
         self.total_bytes = 0
@@ -261,7 +263,7 @@ class AsyncDownloader:
             Filename string, defaulting to 'download' if none found
         """
         if disposition := response.headers.get("Content-Disposition"):
-            if match := search(r"filename[*]?=(?:[\"']?)([^\"';]+)(?:[\"']?)", disposition):
+            if match := search(r"filename[*]?=[\"']?([^\"';]+)[\"']?", disposition):
                 return match.group(1)
 
         path = urlparse(self.url).path
