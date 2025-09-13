@@ -1,10 +1,9 @@
 from asyncio import Semaphore, gather, sleep
 from time import time
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from typing import Dict, List, Optional, Callable, Union
+from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass
 from statistics import mean, median
-from json import dump
 
 
 @dataclass
@@ -49,6 +48,7 @@ class AsyncDownloadSpeedTester:
     - JSON export of results
     - Connection pooling for better performance
     - Rate limiting support
+    - Duration-based speed testing
     """
 
     def __init__(
@@ -68,25 +68,16 @@ class AsyncDownloadSpeedTester:
         self.session_headers = {'User-Agent': user_agent}
         self._session: Optional[ClientSession] = None
 
-    async def __aenter__(
-            self
-    ):
+    async def __aenter__(self):
         """Async context manager entry."""
         await self._ensure_session()
         return self
 
-    async def __aexit__(
-            self,
-            exc_type,
-            exc_val,
-            exc_tb
-    ):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
         await self.close()
 
-    async def _ensure_session(
-            self
-    ):
+    async def _ensure_session(self):
         """Ensure aiohttp session is created."""
         if self._session is None or self._session.closed:
             self._session = ClientSession(
@@ -95,9 +86,7 @@ class AsyncDownloadSpeedTester:
                 timeout=self.timeout
             )
 
-    async def close(
-            self
-    ):
+    async def close(self):
         """Close the aiohttp session and connector."""
         if self._session and not self._session.closed:
             await self._session.close()
@@ -110,7 +99,7 @@ class AsyncDownloadSpeedTester:
             max_size: Optional[int] = None,
             progress_callback: Optional[Callable[[int, float], None]] = None,
             headers: Optional[Dict[str, str]] = None
-    ) -> SpeedResult:
+    ) -> Optional[SpeedResult]:
         """
         Test download speed from a single URL asynchronously.
 
@@ -174,6 +163,80 @@ class AsyncDownloadSpeedTester:
                     )
                 await sleep(self.retry_delay * (2 ** attempt))
 
+    async def test_duration_based(
+            self,
+            url: str,
+            duration_seconds: int,
+            progress_callback: Optional[Callable[[int, float, float], None]] = None,
+            headers: Optional[Dict[str, str]] = None
+    ) -> Optional[SpeedResult]:
+        """
+        Test download speed for a specific duration in seconds.
+
+        Args:
+            url: URL to download from
+            duration_seconds: Duration to run the test in seconds
+            progress_callback: Optional callback with (bytes_downloaded, current_speed_mbps, elapsed_time)
+            headers: Optional additional headers for the request
+
+        Returns:
+            SpeedResult object with results from the duration-based test
+        """
+        await self._ensure_session()
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                start_time = time()
+                bytes_downloaded = 0
+                target_end_time = start_time + duration_seconds
+
+                request_headers = headers or {}
+
+                async with self._session.get(url, headers=request_headers) as response:
+                    response.raise_for_status()
+
+                    async for chunk in response.content.iter_chunked(self.chunk_size):
+                        current_time = time()
+
+                        # Check if duration has been reached
+                        if current_time >= target_end_time:
+                            break
+
+                        bytes_downloaded += len(chunk)
+
+                        if progress_callback:
+                            elapsed_time = current_time - start_time
+                            if elapsed_time > 0:
+                                current_speed = (bytes_downloaded * 8) / (elapsed_time * 1_000_000)
+                                progress_callback(bytes_downloaded, current_speed, elapsed_time)
+
+                actual_duration = time() - start_time
+                speed_bps = bytes_downloaded * 8 / actual_duration if actual_duration > 0 else 0
+                speed_mbps = speed_bps / 1_000_000
+                speed_kbps = speed_bps / 1_000
+
+                return SpeedResult(
+                    url=url,
+                    bytes_downloaded=bytes_downloaded,
+                    duration=actual_duration,
+                    speed_mbps=speed_mbps,
+                    speed_kbps=speed_kbps,
+                    status_code=response.status
+                )
+
+            except Exception as e:
+                if attempt == self.max_retries:
+                    return SpeedResult(
+                        url=url,
+                        bytes_downloaded=0,
+                        duration=0,
+                        speed_mbps=0,
+                        speed_kbps=0,
+                        status_code=0,
+                        error=str(e)
+                    )
+                await sleep(self.retry_delay * (2 ** attempt))
+
     async def test_multiple_urls(
             self,
             urls: List[str],
@@ -207,6 +270,39 @@ class AsyncDownloadSpeedTester:
         tasks = [test_with_semaphore(url) for url in urls]
         return await gather(*tasks, return_exceptions=False)
 
+    async def test_multiple_urls_duration_based(
+            self,
+            urls: List[str],
+            duration_seconds: int,
+            progress_callback: Optional[Callable[[str, int, float, float], None]] = None,
+            headers: Optional[Dict[str, str]] = None,
+            semaphore_limit: Optional[int] = None
+    ) -> List[SpeedResult]:
+        """
+        Test download speed from multiple URLs for a specific duration concurrently.
+
+        Args:
+            urls: List of URLs to test
+            duration_seconds: Duration to run each test in seconds
+            progress_callback: Optional callback with (url, bytes_downloaded, current_speed_mbps, elapsed_time)
+            headers: Optional additional headers for requests
+            semaphore_limit: Optional limit for concurrent downloads (defaults to len(urls))
+
+        Returns:
+            List of SpeedResult objects
+        """
+        semaphore = Semaphore(semaphore_limit or len(urls))
+
+        async def test_with_semaphore(url: str) -> SpeedResult:
+            async with semaphore:
+                callback = None
+                if progress_callback:
+                    callback = lambda b, s, e, u=url: progress_callback(u, b, s, e)
+                return await self.test_duration_based(url, duration_seconds, callback, headers)
+
+        tasks = [test_with_semaphore(url) for url in urls]
+        return await gather(*tasks, return_exceptions=False)
+
     async def benchmark_url(
             self,
             url: str,
@@ -236,6 +332,42 @@ class AsyncDownloadSpeedTester:
                 callback = lambda b, s, r=run: progress_callback(r + 1, b, s)
 
             result = await self.test_single_url(url, max_size, callback)
+            results.append(result)
+
+            if run < num_runs - 1:
+                await sleep(delay_between_runs)
+
+        return self._calculate_summary(results)
+
+    async def benchmark_duration_based(
+            self,
+            url: str,
+            duration_seconds: int,
+            num_runs: int = 5,
+            delay_between_runs: float = 1.0,
+            progress_callback: Optional[Callable[[int, int, float, float], None]] = None
+    ) -> SpeedTestSummary:
+        """
+        Benchmark a single URL multiple times with duration-based testing for statistical analysis.
+
+        Args:
+            url: URL to benchmark
+            duration_seconds: Duration for each test run in seconds
+            num_runs: Number of test runs to perform
+            delay_between_runs: Delay between consecutive runs in seconds
+            progress_callback: Optional callback with (run_number, bytes_downloaded, current_speed_mbps, elapsed_time)
+
+        Returns:
+            SpeedTestSummary with statistical analysis
+        """
+        results = []
+
+        for run in range(num_runs):
+            callback = None
+            if progress_callback:
+                callback = lambda b, s, e, r=run: progress_callback(r + 1, b, s, e)
+
+            result = await self.test_duration_based(url, duration_seconds, callback)
             results.append(result)
 
             if run < num_runs - 1:
@@ -278,10 +410,7 @@ class AsyncDownloadSpeedTester:
 
         return results
 
-    def _calculate_summary(
-            self,
-            results: List[SpeedResult]
-    ) -> SpeedTestSummary:
+    def _calculate_summary(self, results: List[SpeedResult]) -> SpeedTestSummary:
         """Calculate summary statistics from multiple speed test results."""
         successful_results = [r for r in results if r.error is None]
 
@@ -312,65 +441,8 @@ class AsyncDownloadSpeedTester:
             results=results
         )
 
-    def export_results(
-            self,
-            results: Union[List[SpeedResult], SpeedTestSummary],
-            filename: str
-    ) -> None:
-        """
-        Export results to JSON file.
 
-        Args:
-            results: SpeedResult list or SpeedTestSummary to export
-            filename: Output filename
-        """
-        if isinstance(results, SpeedTestSummary):
-            data = {
-                'summary': {
-                    'avg_speed_mbps': results.avg_speed_mbps,
-                    'median_speed_mbps': results.median_speed_mbps,
-                    'max_speed_mbps': results.max_speed_mbps,
-                    'min_speed_mbps': results.min_speed_mbps,
-                    'total_bytes': results.total_bytes,
-                    'total_duration': results.total_duration,
-                    'success_count': results.success_count,
-                    'failure_count': results.failure_count
-                },
-                'results': [
-                    {
-                        'url': r.url,
-                        'bytes_downloaded': r.bytes_downloaded,
-                        'duration': r.duration,
-                        'speed_mbps': r.speed_mbps,
-                        'speed_kbps': r.speed_kbps,
-                        'status_code': r.status_code,
-                        'error': r.error
-                    } for r in results.results
-                ]
-            }
-        else:
-            data = {
-                'results': [
-                    {
-                        'url': r.url,
-                        'bytes_downloaded': r.bytes_downloaded,
-                        'duration': r.duration,
-                        'speed_mbps': r.speed_mbps,
-                        'speed_kbps': r.speed_kbps,
-                        'status_code': r.status_code,
-                        'error': r.error
-                    } for r in results
-                ]
-            }
-
-        with open(filename, 'w') as f:
-            dump(data, f, indent=2)
-
-
-async def quick_speed_test(
-        url: str,
-        max_size_mb: float = 10
-) -> SpeedResult:
+async def quick_speed_test(url: str, max_size_mb: float = 10) -> SpeedResult:
     """
     Convenience function for quick speed test.
 
@@ -385,10 +457,22 @@ async def quick_speed_test(
         return await tester.test_single_url(url, int(max_size_mb * 1024 * 1024))
 
 
-async def compare_urls(
-        urls: List[str],
-        max_size_mb: float = 5
-) -> SpeedTestSummary:
+async def quick_duration_speed_test(url: str, duration_seconds: int = 30) -> SpeedResult:
+    """
+    Convenience function for duration-based speed test.
+
+    Args:
+        url: URL to test
+        duration_seconds: Duration to run the test in seconds
+
+    Returns:
+        SpeedResult object
+    """
+    async with AsyncDownloadSpeedTester() as tester:
+        return await tester.test_duration_based(url, duration_seconds)
+
+
+async def compare_urls(urls: List[str], max_size_mb: float = 5) -> SpeedTestSummary:
     """
     Convenience function to compare speeds across multiple URLs.
 
@@ -401,4 +485,20 @@ async def compare_urls(
     """
     async with AsyncDownloadSpeedTester() as tester:
         results = await tester.test_multiple_urls(urls, int(max_size_mb * 1024 * 1024))
+        return tester._calculate_summary(results)
+
+
+async def compare_urls_duration_based(urls: List[str], duration_seconds: int = 30) -> SpeedTestSummary:
+    """
+    Convenience function to compare speeds across multiple URLs with duration-based testing.
+
+    Args:
+        urls: List of URLs to compare
+        duration_seconds: Duration to run each test in seconds
+
+    Returns:
+        SpeedTestSummary with comparison results
+    """
+    async with AsyncDownloadSpeedTester() as tester:
+        results = await tester.test_multiple_urls_duration_based(urls, duration_seconds)
         return tester._calculate_summary(results)
